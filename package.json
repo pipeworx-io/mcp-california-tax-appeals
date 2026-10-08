@@ -1,0 +1,32 @@
+{
+  "name": "@pipeworx/mcp-california-tax-appeals",
+  "version": "0.1.0",
+  "description": "California Office of Tax Appeals (OTA) opinions — search by statute",
+  "type": "module",
+  "main": "src/index.ts",
+  "types": "src/index.ts",
+  "bin": {
+    "mcp-california-tax-appeals": "bin/cli.js"
+  },
+  "keywords": ["mcp", "mcp-server", "model-context-protocol", "pipeworx", "california-tax-appeals"],
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/pipeworx-io/mcp-california-tax-appeals.git"
+  },
+  "scripts": {
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.30.0",
+    "tsx": "^4.19.0"
+  },
+  "devDependencies": {
+    "typescript": "^5.9.3",
+    "@cloudflare/workers-types": "^4.20260405.1"
+  },
+  "pipeworx": {
+    "sourceHash": "v1-e307123900a44b8e4a3a9c548b007dea8e46ffe82550889ac59dbcb693035caf",
+    "sourceCommit": "e369dfedd93d5fcbf521281559a146302c14e1a0"
+  }
+}
