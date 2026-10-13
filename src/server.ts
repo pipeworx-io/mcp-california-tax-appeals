@@ -7,9 +7,11 @@ import { Server } from '@modelcontextprotocol/sdk/server/index.js';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
 import { CallToolRequestSchema, ListToolsRequestSchema } from '@modelcontextprotocol/sdk/types.js';
 import pack from './index.js';
+import * as bakedIndexModule from './ca-ota-index-data.js';
+const bakedIndex = Object.fromEntries(Object.entries(bakedIndexModule));
 
 const server = new Server(
-  { name: '@pipeworx/mcp-california-tax-appeals', version: '0.1.0' },
+  { name: '@pipeworx/mcp-california-tax-appeals', version: '0.1.1' },
   { capabilities: { tools: {} } },
 );
 
@@ -24,7 +26,9 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
 server.setRequestHandler(CallToolRequestSchema, async (request) => {
   const { name, arguments: args } = request.params;
   try {
-    const result = await pack.callTool(name, (args ?? {}) as Record<string, unknown>);
+    const callArgs = { ...((args ?? {}) as Record<string, unknown>) };
+    callArgs._bakedIndex = bakedIndex;
+    const result = await pack.callTool(name, callArgs);
     return { content: [{ type: 'text', text: JSON.stringify(result, null, 2) }] };
   } catch (err) {
     return {

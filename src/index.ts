@@ -847,6 +847,38 @@ function collapse(s: string): string {
  * real either way). Verified against ND Century Code chapter 12.1-16
  * (Homicide, t12-1c16.pdf) — every content stream in that 9-page PDF uses
  * the indirect form.
+ *
+ * THREE FIXES PORTED FROM mcps/guam-code's PACK-LOCAL FORK (fleet #2904,
+ * folding in #2888's src/gu-pdf-extract.ts -- nothing about them was
+ * actually Guam-specific, which is why they live here now instead of only
+ * in that fork):
+ *   1. inflate()'s two stream writes were fire-and-forget
+ *      (void writer.write(...) / void writer.close()). A malformed deflate
+ *      stream (real, not hypothetical -- seen across several Guam chapter
+ *      PDFs) rejects that detached promise UNHANDLED, invisible to any
+ *      try/catch wrapped around this function's caller and fatal to the
+ *      whole Node process; in a Worker it is an unhandled rejection on a
+ *      live request. Both writes now carry a no-op .catch() -- the real
+ *      failure still surfaces through reader.read() below, which every
+ *      caller already handles.
+ *   2. A literal (parenthesized) string run was decoded by passing its raw
+ *      windows-1252-decoded bytes through unchanged, which is correct for a
+ *      WinAnsi font but wrong for a mapped1/cid font whose code space only
+ *      means anything via its own /ToUnicode CMap -- the same lookup a hex
+ *      string run already gets. Guam's PDF producer writes several of its
+ *      non-WinAnsi subset-embedded fonts' text as literal strings rather
+ *      than hex, which this extractor previously decoded as line-noise
+ *      control characters instead of the real text.
+ *   3. decompressedStream now retries a /FlateDecode stream with its tail
+ *      trimmed 1-4 bytes before giving up. Several real PDFs declare a
+ *      /Length a few bytes LONGER than the true deflate stream (confirmed
+ *      on Guam's 21gc033.pdf object 2: /Length says 96, the deflate stream
+ *      completes at byte 95, byte 96 is one stray trailing byte). Python's
+ *      zlib tolerates trailing garbage by default; the Workers/Node
+ *      DecompressionStream used here does not and throws "Trailing junk
+ *      found after the end of the compressed stream" -- the true stream
+ *      length is always <= the declared one in every sample seen, never
+ *      longer, so trimming is safe.
  */
 
 interface PdfExtractResult {
@@ -854,12 +886,62 @@ interface PdfExtractResult {
    *  could be read — check `warnings`, not just truthiness, before deciding
    *  that means the document has no text. */
   text: string;
-  /** Number of leaf /Type/Page objects found via the Pages tree. */
+  /** Number of leaf /Type/Page objects found via the Pages tree (the WHOLE
+   *  document's page count, even when `pageRange` restricted extraction to
+   *  a subset — see `extractedPages` for how many were actually read). */
   pages: number;
+  /** Number of pages actually extracted into `text`. Equal to `pages`
+   *  unless a `pageRange` option restricted the run. */
+  extractedPages: number;
   /** Non-fatal problems found while extracting (unknown font, missing
    *  ToUnicode, etc). A non-empty array does not mean the text is wrong, but
    *  it means something was guessed rather than read. */
   warnings: string[];
+}
+
+interface PdfExtractOptions {
+  /** Restrict extraction to a slice of the document's leaf pages, bounded by
+   *  PAGE OBJECT NUMBERS rather than page indexes — built for sources (e.g.
+   *  New Mexico's NMOneSource chapter PDFs, fleet #2884) whose per-section
+   *  bookmarks in `extractPdfOutline`'s output give a /Dest page object
+   *  directly, with no indexing step of their own needed. `fromPageObj` is
+   *  resolved to its position in document order and extraction starts
+   *  there; `toPageObj` (also resolved to its position) is the LAST page
+   *  included — pass the object a FOLLOWING bookmark points to and extract
+   *  up to (not including) it by resolving that page's own PRECEDING page
+   *  instead, since this is page-granularity, not byte-granularity. If
+   *  `fromPageObj` is not found among the document's pages, this option is
+   *  ignored and the whole document is extracted (a safe fallback, not a
+   *  silent wrong answer — a warning is added). */
+  pageRange?: { fromPageObj: number; toPageObj?: number };
+
+  /** Called right after a font's own /ToUnicode CMap is parsed (for either
+   *  a Type0 font's CID map or a simple font's 1-byte map), before it is
+   *  used to decode any text. Return a REPLACEMENT map to override specific
+   *  codes, or return nothing (undefined) to use the parsed map unchanged.
+   *  Built for mcps/guam-code (fleet #2888/#2904): one embedded symbol font
+   *  per chapter PDF carries a /ToUnicode CMap that is itself wrong in the
+   *  SOURCE file (confirmed by eye against the rendered PDF — not a general
+   *  parsing defect this shared extractor could detect), so the fix is
+   *  keyed by matching `fontDict` against something only that caller's PDFs
+   *  produce (there, a font name) rather than built into this file. */
+  fontCMapOverride?: (fontDict: string, map: Map<number, number>) => Map<number, number> | void;
+}
+
+interface PdfOutlineEntry {
+  /** The bookmark's own text, verbatim (e.g. "30-2-1. Murder." or
+   *  "ARTICLE 1  General Provisions" or "ANNOTATIONS"). */
+  title: string;
+  /** The PDF page OBJECT NUMBER this bookmark's /Dest (or /A GoTo action)
+   *  points to, or null if neither was found on this node. Pass this
+   *  straight into `extractPdfText`'s `pageRange` option — no index lookup
+   *  needed on the caller's side. */
+  pageObjNum: number | null;
+  /** Nesting depth in the outline tree, root's children = 0. A section's
+   *  own "ANNOTATIONS" child (depth = section's depth + 1) is how a caller
+   *  distinguishes statutory text from case annotations that start on the
+   *  same page — see mcps/new-mexico-code for the worked example. */
+  depth: number;
 }
 
 type FontDecoder =
@@ -877,8 +959,19 @@ type FontDecoder =
 async function inflate(bytes: Uint8Array): Promise<Uint8Array> {
   const ds = new DecompressionStream('deflate');
   const writer = ds.writable.getWriter();
-  void writer.write(bytes);
-  void writer.close();
+  // Fire-and-forget on purpose: the actual decompression result/error comes
+  // through reader.read() below, which every caller already wraps in a
+  // try/catch. Without a .catch() here, a malformed deflate stream rejects
+  // this DETACHED write/close promise UNHANDLED -- invisible to that
+  // try/catch and fatal to the whole process (ported from
+  // mcps/guam-code's gu-pdf-extract.ts FORK FIX 3/3, fleet #2888/#2904;
+  // confirmed crashing scripts/bake-sections.mjs outright on real Guam
+  // chapter PDFs). The no-op .catch() here does not hide a real failure --
+  // it still surfaces through reader.read() for the caller to see.
+  const writeDone = writer.write(bytes).catch(() => {});
+  const closeDone = writer.close().catch(() => {});
+  void writeDone;
+  void closeDone;
   const chunks: Uint8Array[] = [];
   const reader = ds.readable.getReader();
   for (;;) {
@@ -935,7 +1028,7 @@ interface RawObject {
 }
 
 /** Extract readable text from a simple, non-encrypted, non-scanned PDF. */
-async function extractPdfText(buf: ArrayBuffer): Promise<PdfExtractResult> {
+async function extractPdfText(buf: ArrayBuffer, options?: PdfExtractOptions): Promise<PdfExtractResult> {
   const bytes = new Uint8Array(buf);
   // windows-1252 decode is total (every byte maps to exactly one UTF-16 code
   // unit) and length-preserving, so a match index found in `scan` is also a
@@ -951,10 +1044,29 @@ async function extractPdfText(buf: ArrayBuffer): Promise<PdfExtractResult> {
   // inside", which is how Catalog/Pages/ObjStm discovery works regardless of
   // what else that object's dictionary contains — see the file header.
   const objStarts: { index: number; num: number }[] = [];
+  // Object number -> index right after its "N 0 obj" marker (i.e. where the
+  // dictionary text begins), for every object found by the SAME forward
+  // scan that builds objStarts — first occurrence wins, matching what a
+  // one-shot `.exec` would find. This turns getDirectObject's lookup from
+  // one full-document regex scan PER DISTINCT OBJECT NUMBER into one O(1)
+  // map read: with a large page-tree walk (New Mexico's chapter PDFs run
+  // 657-1,138+ pages, fleet #2884) the old per-call scan made even a
+  // `pageRange`-restricted extraction cost nearly as much as extracting the
+  // whole document, because walking the Pages tree alone touches every
+  // page's object once regardless of how many are actually rendered —
+  // measured 1,611ms for a 56-of-1,138-page extraction before this fix vs.
+  // 1,699ms for the full document. The fallback regex scan below is kept
+  // for any object this forward pass didn't catch (none observed, but
+  // cheaper to keep than to prove impossible).
+  const objEndByNum = new Map<number, number>();
   {
     const re = /(\d+)\s+0\s+obj\b/g;
     let m: RegExpExecArray | null;
-    while ((m = re.exec(scan))) objStarts.push({ index: m.index, num: parseInt(m[1], 10) });
+    while ((m = re.exec(scan))) {
+      objStarts.push({ index: m.index, num: parseInt(m[1], 10) });
+      const num = parseInt(m[1], 10);
+      if (!objEndByNum.has(num)) objEndByNum.set(num, m.index + m[0].length);
+    }
   }
   function objNumBefore(markerIndex: number): number | null {
     let lo = 0, hi = objStarts.length - 1, ans: number | null = null;
@@ -968,10 +1080,16 @@ async function extractPdfText(buf: ArrayBuffer): Promise<PdfExtractResult> {
 
   function getDirectObject(n: number): RawObject | null {
     if (objCache.has(n)) return objCache.get(n) ?? null;
-    const re = new RegExp(`(?:^|\\D)${n}\\s+0\\s+obj`);
-    const m = re.exec(scan);
-    if (!m) { objCache.set(n, null); return null; }
-    const objStart = m.index + m[0].length;
+    const fastEnd = objEndByNum.get(n);
+    let objStart: number;
+    if (fastEnd !== undefined) {
+      objStart = fastEnd;
+    } else {
+      const re = new RegExp(`(?:^|\\D)${n}\\s+0\\s+obj`);
+      const m = re.exec(scan);
+      if (!m) { objCache.set(n, null); return null; }
+      objStart = m.index + m[0].length;
+    }
     const endobjIdx = scan.indexOf('endobj', objStart);
     const streamIdx = scan.indexOf('stream', objStart);
     let dict: string;
@@ -1094,12 +1212,28 @@ async function extractPdfText(buf: ArrayBuffer): Promise<PdfExtractResult> {
     const obj = getObject(n);
     if (!obj || !obj.streamBytes) return null;
     if (/\/FlateDecode/.test(obj.dict)) {
-      try {
-        return await inflate(obj.streamBytes);
-      } catch (e) {
-        warnings.push(`inflate failed for object ${n}: ${e instanceof Error ? e.message : String(e)}`);
-        return null;
+      // Ported from mcps/guam-code's gu-pdf-extract.ts FORK FIX (fleet
+      // #2888/#2904): several real PDFs store a /Length a small number of
+      // bytes LONGER than the TRUE deflate stream length (confirmed on
+      // Guam's 21gc033.pdf object 2: /Length says 96, the deflate stream is
+      // complete at byte 95, and the 96th byte is one stray trailing byte).
+      // Python's zlib tolerates trailing garbage by default; the
+      // Workers/Node DecompressionStream used here does not and throws
+      // "Trailing junk found after the end of the compressed stream".
+      // Rather than fail the whole page, retry with the slice trimmed one
+      // byte shorter a few times -- the true stream length is always <= the
+      // declared one in every sample seen, never longer.
+      for (let trim = 0; trim <= 4 && trim < obj.streamBytes.length; trim++) {
+        try {
+          return await inflate(trim === 0 ? obj.streamBytes : obj.streamBytes.subarray(0, obj.streamBytes.length - trim));
+        } catch (e) {
+          if (trim === 4) {
+            warnings.push(`inflate failed for object ${n} even after trimming trailing bytes: ${e instanceof Error ? e.message : String(e)}`);
+            return null;
+          }
+        }
       }
+      return null;
     }
     return obj.streamBytes;
   }
@@ -1145,6 +1279,38 @@ async function extractPdfText(buf: ArrayBuffer): Promise<PdfExtractResult> {
   if (pagesRef !== null) walkPages(pagesRef, 0);
   else warnings.push('no /Type/Catalog or /Type/Pages object found');
 
+  const totalPages = leafPages.length;
+  let pagesToExtract = leafPages;
+  if (options?.pageRange) {
+    const { fromPageObj, toPageObj } = options.pageRange;
+    const fromIdx = leafPages.indexOf(fromPageObj);
+    if (fromIdx === -1) {
+      warnings.push(
+        `pageRange.fromPageObj ${fromPageObj} is not a leaf page in this document — extracting the whole document instead of the requested range.`,
+      );
+    } else {
+      let toIdx = leafPages.length - 1;
+      if (toPageObj !== undefined) {
+        const foundToIdx = leafPages.indexOf(toPageObj);
+        // toPageObj not found, or found strictly BEFORE fromIdx (a bad or
+        // out-of-order bookmark), falls back to end-of-document rather than
+        // producing a negative-length slice. Equal to fromIdx is normal and
+        // valid — a section whose first bookmarked child (e.g. its own
+        // "ANNOTATIONS") starts on the SAME page is a single-page range,
+        // not an error.
+        if (foundToIdx >= fromIdx) toIdx = foundToIdx;
+        else if (foundToIdx !== -1) {
+          warnings.push(
+            `pageRange.toPageObj ${toPageObj} resolves to a page before fromPageObj ${fromPageObj} — extracting through end of document instead.`,
+          );
+        } else {
+          warnings.push(`pageRange.toPageObj ${toPageObj} is not a leaf page in this document — extracting through end of document instead.`);
+        }
+      }
+      pagesToExtract = leafPages.slice(fromIdx, toIdx + 1);
+    }
+  }
+
   /** Parse a /ToUnicode CMap stream's `beginbfchar`/`beginbfrange` blocks into
    *  a code -> Unicode-codepoint map. Shared between Type0's 2-byte CIDs and
    *  a simple font's 1-byte codes — the CMap text format is identical either
@@ -1177,7 +1343,7 @@ async function extractPdfText(buf: ArrayBuffer): Promise<PdfExtractResult> {
         return { kind: 'cid', map: new Map() };
       }
       const map = await parseToUnicodeCMap(parseInt(tuMatch[1], 10));
-      return { kind: 'cid', map };
+      return { kind: 'cid', map: options?.fontCMapOverride?.(obj.dict, map) ?? map };
     }
     // Simple font. Every KRS sample used /WinAnsiEncoding, which decodes
     // directly as windows-1252 bytes below — unchanged. North Dakota's
@@ -1193,7 +1359,8 @@ async function extractPdfText(buf: ArrayBuffer): Promise<PdfExtractResult> {
     if (!/\/Encoding\s*\/WinAnsiEncoding\b/.test(obj.dict)) {
       const tuMatch = /\/ToUnicode\s+(\d+)\s+0\s+R/.exec(obj.dict);
       if (tuMatch) {
-        const map = await parseToUnicodeCMap(parseInt(tuMatch[1], 10));
+        const parsedMap = await parseToUnicodeCMap(parseInt(tuMatch[1], 10));
+        const map = options?.fontCMapOverride?.(obj.dict, parsedMap) ?? parsedMap;
         if (map.size) return { kind: 'mapped1', map };
       }
       warnings.push(`font object ${fontObjNum} has a non-WinAnsi simple encoding and no usable /ToUnicode; decoded as WinAnsi anyway`);
@@ -1206,7 +1373,26 @@ async function extractPdfText(buf: ArrayBuffer): Promise<PdfExtractResult> {
   const TJ_PIECE_RE = /\(((?:\\.|[^()])*)\)|<([0-9A-Fa-f\s]*)>/g;
 
   function decodeRun(dec: FontDecoder, literal: string | undefined, hex: string | undefined): string {
-    if (literal !== undefined) return unescapePdfLiteral(literal);
+    if (literal !== undefined) {
+      const unescaped = unescapePdfLiteral(literal);
+      // Ported from mcps/guam-code's gu-pdf-extract.ts FORK FIX 1/2 (fleet
+      // #2888/#2904): a WinAnsi run's literal-string bytes ARE already the
+      // correct windows-1252 text (unchanged below) -- but a non-WinAnsi
+      // simple font ('mapped1') or a Type0 font ('cid') can ALSO show up as
+      // a literal string rather than hex. Guam's PDF producer writes
+      // several of its subset-embedded fonts' text this way; passing the
+      // raw byte through unchanged (the old behavior here) skips that
+      // font's /ToUnicode map entirely and produces line-noise control
+      // characters instead of the real character -- route it through the
+      // SAME decoder a hex run below already uses.
+      if (dec.kind === 'winansi') return unescaped;
+      let out = '';
+      for (let i = 0; i < unescaped.length; i++) {
+        const code = unescaped.charCodeAt(i) & 0xff;
+        out += String.fromCodePoint(dec.map.get(code) ?? 0xfffd);
+      }
+      return out;
+    }
     const cleaned = (hex ?? '').replace(/\s+/g, '');
     let out = '';
     if (dec.kind === 'mapped1') {
@@ -1227,7 +1413,7 @@ async function extractPdfText(buf: ArrayBuffer): Promise<PdfExtractResult> {
   }
 
   const pageTexts: string[] = [];
-  for (const pn of leafPages) {
+  for (const pn of pagesToExtract) {
     const page = getObject(pn);
     if (!page) continue;
 
@@ -1291,7 +1477,122 @@ async function extractPdfText(buf: ArrayBuffer): Promise<PdfExtractResult> {
     pageTexts.push(out.trim());
   }
 
-  return { text: pageTexts.join('\n\n'), pages: leafPages.length, warnings };
+  return { text: pageTexts.join('\n\n'), pages: totalPages, extractedPages: pagesToExtract.length, warnings };
+}
+
+/**
+ * Parse a PDF's outline (bookmark) tree into a flat, document-order list of
+ * {title, pageObjNum, depth} entries — WITHOUT decompressing any content
+ * stream, so this is orders of magnitude cheaper than `extractPdfText` and
+ * safe to run just to decide WHERE to extract from. Built for
+ * mcps/new-mexico-code (fleet #2884): NMOneSource publishes each NMSA 1978
+ * CHAPTER as one PDF (657-1,138+ pages observed) but bookmarks every
+ * ARTICLE heading (depth 0), every SECTION citation (depth 1, e.g.
+ * "30-2-1. Murder."), and that section's own "ANNOTATIONS" sub-heading
+ * (depth 2) — giving a caller everything needed to resolve a bare citation
+ * straight to a page RANGE via `extractPdfText`'s `pageRange` option,
+ * without ever extracting pages the caller didn't ask for.
+ *
+ * Assumes outline objects are DIRECT (never compressed into an /ObjStm) —
+ * true of every source sampled while building this. A PDF whose outline IS
+ * compressed, or that has no /Outlines at all, returns an empty array
+ * rather than guessing; check for that before concluding a citation isn't
+ * bookmarked.
+ */
+function extractPdfOutline(buf: ArrayBuffer): PdfOutlineEntry[] {
+  const bytes = new Uint8Array(buf);
+  const scan = new TextDecoder('windows-1252').decode(bytes);
+
+  const objStarts: { index: number; num: number }[] = [];
+  // See extractPdfText's identical map for why: one O(1) lookup per object
+  // instead of one full-document regex scan — an outline tree with ~1,400
+  // bookmarks (New Mexico's larger chapters) made this function itself the
+  // bottleneck before this fix (measured 2.8s on Chapter 30's 5.8MB PDF).
+  const objEndByNum = new Map<number, number>();
+  {
+    const re = /(\d+)\s+0\s+obj\b/g;
+    let m: RegExpExecArray | null;
+    while ((m = re.exec(scan))) {
+      objStarts.push({ index: m.index, num: parseInt(m[1], 10) });
+      const num = parseInt(m[1], 10);
+      if (!objEndByNum.has(num)) objEndByNum.set(num, m.index + m[0].length);
+    }
+  }
+  function objNumBefore(markerIndex: number): number | null {
+    let lo = 0, hi = objStarts.length - 1, ans: number | null = null;
+    while (lo <= hi) {
+      const mid = (lo + hi) >> 1;
+      if (objStarts[mid].index <= markerIndex) { ans = objStarts[mid].num; lo = mid + 1; }
+      else hi = mid - 1;
+    }
+    return ans;
+  }
+
+  const dictCache = new Map<number, string | null>();
+  function dictOf(n: number): string | null {
+    if (dictCache.has(n)) return dictCache.get(n) ?? null;
+    let start: number;
+    const fastEnd = objEndByNum.get(n);
+    if (fastEnd !== undefined) {
+      start = fastEnd;
+    } else {
+      const re = new RegExp(`(?:^|\\D)${n}\\s+0\\s+obj`);
+      const m = re.exec(scan);
+      if (!m) { dictCache.set(n, null); return null; }
+      start = m.index + m[0].length;
+    }
+    const end = scan.indexOf('endobj', start);
+    const dict = end === -1 ? scan.slice(start, Math.min(scan.length, start + 4000)) : scan.slice(start, end);
+    dictCache.set(n, dict);
+    return dict;
+  }
+
+  // Prefer the Catalog's own /Outlines reference; fall back to the first
+  // direct /Type/Outlines object found anywhere (same "search for the type
+  // marker as plain text" approach extractPdfText uses for Catalog/Pages).
+  let outlinesRoot: number | null = null;
+  const catIdx = scan.search(/\/Type\s*\/Catalog\b/);
+  if (catIdx !== -1) {
+    const catNum = objNumBefore(catIdx);
+    const catDict = catNum !== null ? dictOf(catNum) : null;
+    const om = catDict ? /\/Outlines\s+(\d+)\s+0\s+R/.exec(catDict) : null;
+    if (om) outlinesRoot = parseInt(om[1], 10);
+  }
+  if (outlinesRoot === null) {
+    const outIdx = scan.search(/\/Type\s*\/Outlines\b/);
+    if (outIdx !== -1) outlinesRoot = objNumBefore(outIdx);
+  }
+  if (outlinesRoot === null) return [];
+
+  function pageObjOf(dict: string): number | null {
+    const destMatch = /\/Dest\s*\[\s*(\d+)\s+0\s+R/.exec(dict);
+    if (destMatch) return parseInt(destMatch[1], 10);
+    const actionMatch = /\/A\s*<<[^>]*\/D\s*\[\s*(\d+)\s+0\s+R/.exec(dict);
+    if (actionMatch) return parseInt(actionMatch[1], 10);
+    return null;
+  }
+
+  const entries: PdfOutlineEntry[] = [];
+  const seen = new Set<number>();
+  function walk(n: number, depth: number): void {
+    if (depth > 20 || seen.has(n)) return; // guards a malformed/cyclic tree
+    seen.add(n);
+    const dict = dictOf(n);
+    if (!dict) return;
+    const titleMatch = /\/Title\s*\(((?:\\.|[^()])*)\)/.exec(dict);
+    if (titleMatch) {
+      entries.push({ title: unescapePdfLiteral(titleMatch[1]).replace(/\s+/g, ' ').trim(), pageObjNum: pageObjOf(dict), depth });
+    }
+    const firstMatch = /\/First\s+(\d+)\s+0\s+R/.exec(dict);
+    if (firstMatch) walk(parseInt(firstMatch[1], 10), titleMatch ? depth + 1 : depth);
+    const nextMatch = /\/Next\s+(\d+)\s+0\s+R/.exec(dict);
+    if (nextMatch) walk(parseInt(nextMatch[1], 10), depth);
+  }
+  const rootDict = dictOf(outlinesRoot);
+  const rootFirst = rootDict ? /\/First\s+(\d+)\s+0\s+R/.exec(rootDict) : null;
+  if (rootFirst) walk(parseInt(rootFirst[1], 10), 0);
+
+  return entries;
 }
 /**
  * California Office of Tax Appeals (OTA) opinions — search by statute
