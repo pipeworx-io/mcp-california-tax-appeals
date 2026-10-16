@@ -1,6 +1,6 @@
 {
   "name": "@pipeworx/mcp-california-tax-appeals",
-  "version": "0.1.1",
+  "version": "0.1.2",
   "description": "California Office of Tax Appeals (OTA) opinions — search by statute section/topic across issued opinions, retrieve one opinion by its OTA citation with full text and cited provisions. Fleet #2825, the first of a planned pattern for other state tax tribunals.",
   "type": "module",
   "main": "src/index.ts",
@@ -26,7 +26,7 @@
     "@cloudflare/workers-types": "^4.20260405.1"
   },
   "pipeworx": {
-    "sourceHash": "v1-717e342430ec8d8f10fe10e5f1c052bcef60529ccd9abe25843d92c76ee3b225",
-    "sourceCommit": "3723e46c6d115bd4a1fd2175e6bf758555e7cb50"
+    "sourceHash": "v1-e0bba211b952bc37ec5bee43164d5f9905c122fd80b2842dd2a5d93de2dfe397",
+    "sourceCommit": "fe38188882d0fe91e5a45d82b7b989b4aae1e8b6"
   }
 }
