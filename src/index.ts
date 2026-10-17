@@ -1821,6 +1821,94 @@ function extractCitations(text: string): string[] {
   return [...seen];
 }
 
+// fleet #3202 — the search used to be a literal substring match of the
+// WHOLE raw query against "title + issues", so a two-word phrasing that
+// did not appear as a contiguous substring (and a year, which almost never
+// appears inside an opinion's title or Issues tag) silently returned
+// found:false. Three independent fixes below:
+//   1. word-token matching — every term in the query must appear SOMEWHERE
+//      in the row text, in any order, not as one contiguous phrase.
+//   2. a small bidirectional synonym/abbreviation table, since OTA's own
+//      "Issues" tags use short forms ("GenAI hallucinations") that a
+//      reasonable caller spells out ("generative AI", "artificial
+//      intelligence").
+//   3. a year is pulled out of the query text and applied as a filter on
+//      the row's own `year` field (also settable directly via the `year`
+//      argument) rather than requiring the digits to appear in the text.
+
+/** Bidirectional abbreviation <-> expansion pairs seen in OTA's own "Issues"
+ *  tags. Each group is a list of equivalent phrases; if ANY of them is
+ *  present in a row's text, every other phrase in the group is treated as
+ *  present too (see expandSynonyms). Add new groups here as OTA's own
+ *  shorthand turns up more of them — this is deliberately small and
+ *  OTA-specific, not a general thesaurus. */
+const SYNONYM_GROUPS: string[][] = [
+  ['genai', 'generative ai'],
+  ['ai', 'artificial intelligence'],
+];
+
+function phrasePattern(phrase: string): RegExp {
+  return new RegExp(`\\b${phrase.trim().replace(/\s+/g, '\\s+')}\\b`, 'i');
+}
+
+/** Expands a lowercased haystack so any phrase in a SYNONYM_GROUPS group
+ *  becomes findable via any other phrase in that group. Two passes so a
+ *  chained abbreviation (e.g. "genai" -> "generative ai" -> "ai" ->
+ *  "artificial intelligence") resolves regardless of the groups' order. */
+function expandSynonyms(hayLower: string): string {
+  let expanded = hayLower;
+  for (let pass = 0; pass < 2; pass++) {
+    for (const group of SYNONYM_GROUPS) {
+      if (!group.some((phrase) => phrasePattern(phrase).test(expanded))) continue;
+      for (const phrase of group) {
+        if (!phrasePattern(phrase).test(expanded)) expanded += ` ${phrase}`;
+      }
+    }
+  }
+  return expanded;
+}
+
+/** A standalone 4-digit year token (1900-2099), pulled out of free text so
+ *  it can be applied as a filter on the row's own `year` field instead of
+ *  requiring the digits to literally appear in the title/Issues text --
+ *  they almost never do. Only a WHOLE token (word-boundary) counts, so a
+ *  statute number that happens to contain four digits in a row (there are
+ *  none in the R&TC/CCR/IRC shapes this pack indexes) is not mistaken for
+ *  one. */
+const YEAR_TOKEN_RE = /\b(19|20)\d{2}\b/;
+
+function extractYearToken(raw: string): { year: number | null; rest: string } {
+  const m = YEAR_TOKEN_RE.exec(raw);
+  if (!m) return { year: null, rest: raw };
+  const year = Number(m[0]);
+  const rest = `${raw.slice(0, m.index)} ${raw.slice(m.index + m[0].length)}`.trim().replace(/\s+/g, ' ');
+  return { year, rest };
+}
+
+function tokenizeTerms(text: string): string[] {
+  return text.trim().split(/\s+/).filter(Boolean).map((t) => t.toLowerCase());
+}
+
+/** Short, purely-alphabetic terms ("ai", "bt") need word-boundary matching
+ *  -- a plain substring test would match "said" or "fair". Anything with a
+ *  digit or punctuation (statute numbers, citation shapes like "17951-4"
+ *  or "R&TC") keeps the old substring behavior, which is what those shapes
+ *  need to be found at all, and longer plain words (e.g. "resid" matching
+ *  "residency") stay partial-match friendly on purpose. */
+function termMatches(term: string, hayLower: string): boolean {
+  if (/^[a-z]+$/.test(term) && term.length <= 3) return phrasePattern(term).test(hayLower);
+  return hayLower.includes(term);
+}
+
+function describeFilters(f: { terms: string[]; year: number | null; category: OtaCategory | null; precedentialOnly: boolean }): string {
+  const parts: string[] = [];
+  if (f.terms.length) parts.push(`all of [${f.terms.join(', ')}] (with OTA shorthand expanded)`);
+  if (f.year != null) parts.push(`year = ${f.year}`);
+  if (f.category) parts.push(`category = ${f.category}`);
+  if (f.precedentialOnly) parts.push('precedential_only = true');
+  return parts.length ? parts.join(' AND ') : '(no filters)';
+}
+
 function shapeSearchRow(r: OtaOpinionRow) {
   return {
     cite: r.cite,
@@ -1841,46 +1929,92 @@ function shapeSearchRow(r: OtaOpinionRow) {
 async function caOtaSearch(args: Record<string, unknown>) {
   ensureIndex(args);
   const raw = String(args.query ?? '').trim();
-  if (!raw) {
-    return {
-      found: false,
-      reason: 'empty_query',
-      message: 'ca_ota_search needs a statute citation or topic keyword, e.g. "residency", "innocent spouse", or "17014".',
-    };
-  }
   const categoryFilter = args.category === 'fit' || args.category === 'bt' ? (args.category as OtaCategory) : null;
   const precedentialOnly = args.precedential_only === true;
   const limit = Math.min(Math.max(Number(args.limit) || 25, 1), 100);
 
-  const needle = raw.toLowerCase();
-  const digits = (raw.match(/\d[\d.]*\d|\d/g) ?? []).join('|');
-  const digitRe = digits ? new RegExp(digits.replace(/\./g, '\\.')) : null;
+  let explicitYear: number | null = null;
+  if (args.year != null && args.year !== '') {
+    const n = Number(args.year);
+    if (!Number.isFinite(n) || n < 1900 || n > 2100) {
+      return {
+        found: false,
+        reason: 'bad_year',
+        message: `year must be a 4-digit calendar year (e.g. 2026); got ${JSON.stringify(args.year)}.`,
+      };
+    }
+    explicitYear = n;
+  }
+
+  // Pull a bare year out of the free-text query (fleet #3202: "2026" used
+  // to be matched literally against title+issues text, where it almost
+  // never appears, and silently returned zero) and apply it as a filter
+  // on the row's own `year` field instead.
+  const { year: parsedYear, rest } = extractYearToken(raw);
+  const yearFilter = explicitYear ?? parsedYear;
+  const termText = rest.trim();
+  const terms = termText ? tokenizeTerms(termText) : [];
+
+  if (terms.length === 0 && yearFilter == null && !categoryFilter && !precedentialOnly) {
+    return {
+      found: false,
+      reason: 'empty_query',
+      message: 'ca_ota_search needs a statute citation, topic keyword (e.g. "residency", "innocent spouse", "17014"), a year, or at least one of category/precedential_only.',
+    };
+  }
 
   const matches = ROWS.filter((r) => {
     if (categoryFilter && r.category !== categoryFilter) return false;
     if (precedentialOnly && !isPrecedential(r.decision_type)) return false;
-    const hay = `${r.title} ${r.issues ?? ''}`.toLowerCase();
-    if (hay.includes(needle)) return true;
-    if (digitRe && digitRe.test(hay)) return true;
-    return false;
+    if (yearFilter != null && r.year !== yearFilter) return false;
+    if (terms.length === 0) return true;
+    const hay = expandSynonyms(`${r.title} ${r.issues ?? ''}`.toLowerCase());
+    return terms.every((t) => termMatches(t, hay));
   });
 
-  // Most recent first — a topic/statute search is almost always for the
-  // current state of the law, and OTA's own precedential opinions
+  // Exact-first ranking: a row whose (synonym-expanded) text contains the
+  // caller's own term text as one contiguous phrase outranks a row that
+  // only satisfied the looser "every term, any order" test — then most
+  // recent first, since a topic/statute search is almost always for the
+  // current state of the law and OTA's own precedential opinions
   // supersede earlier ones on the same issue.
-  matches.sort((a, b) => (b.year ?? 0) - (a.year ?? 0) || (b.cite > a.cite ? 1 : -1));
+  const phrase = termText.toLowerCase();
+  const isExact = (r: OtaOpinionRow): boolean => {
+    if (!phrase) return true;
+    return expandSynonyms(`${r.title} ${r.issues ?? ''}`.toLowerCase()).includes(phrase);
+  };
+  matches.sort((a, b) => {
+    const diff = Number(isExact(b)) - Number(isExact(a));
+    if (diff !== 0) return diff;
+    return (b.year ?? 0) - (a.year ?? 0) || (b.cite > a.cite ? 1 : -1);
+  });
 
   const page = matches.slice(0, limit);
+  const filtersTried = { terms, year: yearFilter, category: categoryFilter, precedentialOnly };
   return {
     found: page.length > 0,
     query: raw,
     count: matches.length,
     returned: page.length,
     opinions: page.map(shapeSearchRow),
+    filters_tried: {
+      terms,
+      year: yearFilter,
+      category: categoryFilter,
+      precedential_only: precedentialOnly,
+    },
+    ...(page.length === 0
+      ? {
+          reason: 'no_match',
+          message: `No opinions matched ${describeFilters(filtersTried)}.`,
+        }
+      : {}),
     coverage_note:
-      'Searches OTA\'s own published listing metadata only (opinion title + OTA\'s one-line "Issues" topic/statute tag) — OTA ' +
-      'publishes no full-text search of opinion bodies. A statute cited only inside an opinion\'s full text, and not in its ' +
-      'Issues tag, will not be found by this search; use ca_ota_opinion_lookup on a specific citation for that opinion\'s full text.',
+      'Searches OTA\'s own published listing metadata only (opinion title + OTA\'s one-line "Issues" topic/statute tag), with a small ' +
+      'bidirectional synonym table for OTA\'s own shorthand (e.g. "GenAI" <-> "generative AI" <-> "AI" <-> "artificial intelligence") ' +
+      '— OTA publishes no full-text search of opinion bodies. A statute cited only inside an opinion\'s full text, and not in its ' +
+      'Issues tag, will not be found by this search; use ca_ota_opinion_lookup on a specific citation for that opinion\'s full text. ' +
+      'A year in `query` text is treated as a filter on the opinion\'s own issuance year (same as passing `year` directly), not as text to match.',
     index_captured_at: CAPTURED_AT,
     index_total_opinions: TOTAL_ROWS,
     source_url: 'https://ota.ca.gov/opinions/',
@@ -2004,13 +2138,17 @@ const tools: McpToolExport['tools'] = [
   {
     name: 'ca_ota_search',
     description:
-      'Find California Office of Tax Appeals (OTA) opinions by statute citation or topic keyword (e.g. "residency", "innocent spouse", "17014", "17951-4") -- returns citation, title, date, tax category (Franchise/Income vs Business Tax), precedential status, and OTA\'s own one-line issue/statute tag, most recent first. PARTIAL: this searches opinion titles and OTA\'s published "Issues" tag only, not full opinion text (OTA publishes no full-text search). For full text and all cited provisions of a specific opinion, use ca_ota_opinion_lookup. Sourced from ota.ca.gov\'s own opinion listing pages.',
+      'Find California Office of Tax Appeals (OTA) opinions by statute citation or topic keyword (e.g. "residency", "innocent spouse", "17014", "17951-4", "generative AI") -- returns citation, title, date, tax category (Franchise/Income vs Business Tax), precedential status, and OTA\'s own one-line issue/statute tag, most recent first with an exact phrase match ranked above a looser match. Matches every word of `query` (any order), with a small bidirectional synonym table for OTA\'s own shorthand (e.g. "GenAI" <-> "generative AI" <-> "AI" <-> "artificial intelligence"). Use `year` for "opinions from 2026" rather than putting the year in `query` text -- it almost never appears inside an opinion\'s title or Issues tag. PARTIAL: this searches opinion titles and OTA\'s published "Issues" tag only, not full opinion text (OTA publishes no full-text search). For full text and all cited provisions of a specific opinion, use ca_ota_opinion_lookup. Sourced from ota.ca.gov\'s own opinion listing pages.',
     inputSchema: {
       type: 'object' as const,
       properties: {
         query: {
           type: 'string',
-          description: 'A topic keyword (e.g. "residency", "penalties", "innocent spouse") or a statute citation/number (e.g. "17014" or "R&TC 19045").',
+          description: 'A topic keyword (e.g. "residency", "penalties", "innocent spouse", "generative AI") or a statute citation/number (e.g. "17014" or "R&TC 19045"). May be omitted if you only need `year`/`category`/`precedential_only` filters. A bare year inside this text (e.g. "2026") is treated as a `year` filter, not as text to match.',
+        },
+        year: {
+          type: 'number',
+          description: 'Optional filter: only opinions issued in this calendar year, e.g. 2026. Prefer this over putting the year inside `query` -- OTA\'s own title/Issues tag almost never repeats the year.',
         },
         category: {
           type: 'string',
@@ -2026,7 +2164,7 @@ const tools: McpToolExport['tools'] = [
           description: 'Max opinions to return, default 25, max 100.',
         },
       },
-      required: ['query'],
+      required: [],
     },
   },
   {
