@@ -3,7 +3,7 @@
   "name": "io.github.pipeworx-io/california-tax-appeals",
   "title": "California Tax Appeals",
   "description": "California Office of Tax Appeals (OTA) opinions — search by statute section/topic across issued…",
-  "version": "0.1.3",
+  "version": "0.1.4",
   "websiteUrl": "https://pipeworx.io/packs/california-tax-appeals",
   "repository": {
     "url": "https://github.com/pipeworx-io/mcp-california-tax-appeals",
