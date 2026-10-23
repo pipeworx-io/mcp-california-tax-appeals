@@ -382,10 +382,26 @@ async function httpErrorMessage(res: Response, name: string): Promise<string> {
   // internal-host-class.ts; no-op for every third-party upstream, which is why
   // this touches 481 packs' error text and changes none of it.
   return markInternalOrigin(
-    `${name}: ${res.status}${detailSuffix(await readDetail(res))}`,
+    `${name}: ${res.status}${detailSuffix(await readDetail(res))}${responseHints(res)}`,
     res.url,
     res.status,
   );
+}
+
+/**
+ * Facts about a FAILED response that live in its headers, not its body, appended
+ * so the gateway's classifier (which only ever sees this string) can tell a limit
+ * from a wall from a refusal (fleet #3477). Both are standard, both are absent on
+ * almost every response, and neither is invented: `Retry-After` is the server
+ * saying "come back later" (the one thing that makes a 403 a throttle), and
+ * Cloudflare marks a bot challenge with `cf-mitigated: challenge`.
+ */
+function responseHints(res: Response): string {
+  const hints: string[] = [];
+  const retryAfter = res.headers.get('retry-after');
+  if (retryAfter) hints.push(`retry-after: ${retryAfter.slice(0, 40)}`);
+  if ((res.headers.get('cf-mitigated') ?? '').toLowerCase() === 'challenge') hints.push('Cloudflare bot challenge (cf-mitigated: challenge)');
+  return hints.length ? ` (${hints.join('; ')})` : '';
 }
 
 /**
@@ -1193,7 +1209,10 @@ interface PdfOutlineEntry {
 }
 
 type FontDecoder =
-  | { kind: 'winansi' }
+  // `simple`: the font is a declared simple (1-byte-code) font with
+  // /Encoding /WinAnsiEncoding, so a HEX string shown through it is a run of
+  // 1-byte windows-1252 codes, not 2-byte CIDs (fleet #3478).
+  | { kind: 'winansi'; simple?: boolean }
   | { kind: 'cid'; map: Map<number, number> }
   // Simple (1-byte-code) font decoded via its own /ToUnicode CMap rather than
   // WinAnsi — see fontDecoderFor's comment on North Dakota's subsetted fonts.
@@ -1654,8 +1673,9 @@ async function extractPdfText(buf: ArrayBuffer, options?: PdfExtractOptions): Pr
         if (map.size) return { kind: 'mapped1', map };
       }
       warnings.push(`font object ${fontObjNum} has a non-WinAnsi simple encoding and no usable /ToUnicode; decoded as WinAnsi anyway`);
+      return { kind: 'winansi' };
     }
-    return { kind: 'winansi' };
+    return { kind: 'winansi', simple: /\/Subtype\s*\/(?:TrueType|Type1)\b/.test(obj.dict) };
   }
 
   const TOKEN_RE =
@@ -1724,6 +1744,16 @@ async function extractPdfText(buf: ArrayBuffer, options?: PdfExtractOptions): Pr
     }
     const cleaned = (hex ?? '').replace(/\s+/g, '');
     let out = '';
+    // A hex string shown through a declared simple WinAnsi font is 1-byte
+    // codes. Reading it as 2-byte CIDs (the fall-through below) kept only
+    // every other byte's low half and silently dropped Danish ø/å/æ from
+    // Folketinget minister answers: `<F86265>` is "øbe", not one glyph 'b'
+    // (fleet #3478). Odd trailing nibble is ignored.
+    if (dec.kind === 'winansi' && dec.simple) {
+      const bytes = new Uint8Array(Math.floor(cleaned.length / 2));
+      for (let i = 0; i < bytes.length; i++) bytes[i] = parseInt(cleaned.slice(i * 2, i * 2 + 2), 16);
+      return new TextDecoder('windows-1252').decode(bytes);
+    }
     if (dec.kind === 'mapped1') {
       // 1-byte code per glyph (a simple font's code space), unlike Type0's
       // 2-byte CIDs below — see fontDecoderFor.
